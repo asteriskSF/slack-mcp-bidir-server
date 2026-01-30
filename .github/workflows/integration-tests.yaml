@@ -1,10 +1,11 @@
 name: Integration Tests
 on:
-  push:
-    branches:
-      - master
-  pull_request_target:
   workflow_dispatch:
+  # Disabled auto-trigger — requires upstream secrets (NGROK, OpenAI, xoxp token)
+  # push:
+  #   branches:
+  #     - master
+  # pull_request_target:
 
 permissions:
   contents: read
