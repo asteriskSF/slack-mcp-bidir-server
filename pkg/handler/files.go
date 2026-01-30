@@ -243,25 +243,5 @@ func (h *FilesHandler) resolveChannelID(channel string) (string, error) {
 	return channelsMaps.Channels[id].ID, nil
 }
 
-// isTextMimetype returns true if the MIME type represents text content.
-func isTextMimetype(mimetype string) bool {
-	if strings.HasPrefix(mimetype, "text/") {
-		return true
-	}
-	textTypes := []string{
-		"application/json",
-		"application/xml",
-		"application/javascript",
-		"application/x-yaml",
-		"application/yaml",
-		"application/x-sh",
-		"application/x-python",
-	}
-	for _, t := range textTypes {
-		if mimetype == t {
-			return true
-		}
-	}
-	return false
-}
+
 
