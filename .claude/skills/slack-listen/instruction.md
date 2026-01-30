@@ -8,9 +8,10 @@ and respond to messages from users.
    - --create <n>: Create channel first, then monitor
    - --private: Used with --create for private channel
    - --config <path>: Alternate config file path
-   - --mode <event|poll>: Listening mode (default: event)
-     - event: Use slack_wait_for_event (foreground, requires Socket Mode)
-     - poll: Use conversations_history polling (background-compatible)
+   - --mode <subscribe|event|poll>: Listening mode (default: subscribe)
+     - subscribe: Use slack_subscribe + slack_get_events (persistent, no event loss)
+     - event: Use slack_wait_for_event (ephemeral, blocks until event arrives)
+     - poll: Use conversations_history polling (fallback, no Socket Mode needed)
 
 2. Load configuration:
    - If --config specified, load that file
@@ -53,7 +54,7 @@ and respond to messages from users.
 | auto_handle | string[] | ["question"] | Request types to handle automatically |
 | require_approval | string[] | [] | Request types needing confirmation |
 | include_reactions | boolean | false | Also listen for reaction events |
-| mode | string | "event" | Listening mode: "event" or "poll" |
+| mode | string | "subscribe" | Listening mode: "subscribe", "event", or "poll" |
 
 ## Main Loop
 
@@ -69,9 +70,27 @@ while true:
     8. Mark complete
 ```
 
+### Step 0 (once, at startup): Create Subscription
+
+**Subscribe mode only** (default):
+Call `slack_subscribe` with:
+- channels: [<resolved_channel>]
+- include_reactions: <from_config>
+
+Store the returned `subscription_id` for use in the main loop.
+
 ### Step 1: Wait for New Message
 
-**Event mode** (default, foreground):
+**Subscribe mode** (default, persistent):
+Call `slack_get_events` with:
+- subscription_id: <stored subscription_id>
+
+This is non-blocking and returns all buffered events since the last drain.
+If event_count is 0, call `slack_wait_for_event` with timeout_seconds: 30 as a short
+blocking wait to avoid busy-looping, then call `slack_get_events` again.
+Process events one at a time (oldest first). After processing all events, loop back.
+
+**Event mode** (ephemeral, foreground):
 Call `slack_wait_for_event` with:
 - channels: [<resolved_channel>]
 - include_reactions: <from_config>
@@ -79,7 +98,7 @@ Call `slack_wait_for_event` with:
 
 If event_type is "timeout", continue loop.
 
-**Poll mode** (background-compatible):
+**Poll mode** (fallback, no Socket Mode needed):
 Call `conversations_history` with:
 - channel_id: <resolved_channel>
 - limit: "50"
@@ -149,6 +168,7 @@ Consider project_context when classifying.
 **If request type is in require_approval:**
 1. Post to thread: "I can help with [describe task]. React with thumbsup to proceed or x to cancel."
 2. Wait for response:
+   - Subscribe mode: Call slack_get_events (subscription already includes reactions if configured); if no approval event, use slack_wait_for_event with include_reactions: true, timeout_seconds: 60, then check slack_get_events again. Repeat until approval or 1 hour elapsed.
    - Event mode: Call slack_wait_for_event with include_reactions: true, timeout_seconds: 3600
    - Poll mode: Poll conversations_replies on the thread for new responses, check for reaction text
 3. Check response:
@@ -210,3 +230,4 @@ Go back to Step 1.
 - When sharing code, use slack_upload_file for anything longer than a few lines
 - Never expose secrets, tokens, or credentials in Slack messages
 - If a request is ambiguous, ask for clarification rather than guessing
+- In subscribe mode, call slack_unsubscribe with the subscription_id when stopping (if possible)

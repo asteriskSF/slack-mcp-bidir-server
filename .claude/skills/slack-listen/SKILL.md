@@ -16,7 +16,7 @@ Monitors a Slack channel and responds to messages.
 | `--create <n>` | Create channel if doesn't exist, then monitor |
 | `--private` | With --create, makes channel private |
 | `--config <path>` | Use alternate config file |
-| `--mode <event\|poll>` | Listening mode: event (foreground) or poll (background-compatible) |
+| `--mode <subscribe\|event\|poll>` | Listening mode: subscribe (persistent, default), event (ephemeral), or poll (history-based) |
 
 ## Examples
 
@@ -25,7 +25,8 @@ Monitors a Slack channel and responds to messages.
 /slack-listen --channel #cala-v2         # Override to specific channel
 /slack-listen --create #experiment       # Create public channel and monitor
 /slack-listen --create #secret --private # Create private channel
-/slack-listen --channel #dev --mode poll # Poll mode (background-compatible)
+/slack-listen --channel #dev --mode subscribe  # Persistent subscription (default)
+/slack-listen --channel #dev --mode poll       # History polling fallback
 ```
 
 ## Configuration
