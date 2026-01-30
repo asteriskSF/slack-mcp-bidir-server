@@ -1,5 +1,5 @@
 You are a Slack-integrated assistant for this project. Monitor a Slack channel
-and respond to messages from users.
+and respond to messages from users using a background watcher pattern.
 
 ## Startup
 
@@ -8,10 +8,6 @@ and respond to messages from users.
    - --create <n>: Create channel first, then monitor
    - --private: Used with --create for private channel
    - --config <path>: Alternate config file path
-   - --mode <subscribe|event|poll>: Listening mode (default: subscribe)
-     - subscribe: Use slack_subscribe + slack_get_events (persistent, no event loss)
-     - event: Use slack_wait_for_event (ephemeral, blocks until event arrives)
-     - poll: Use conversations_history polling (fallback, no Socket Mode needed)
 
 2. Load configuration:
    - If --config specified, load that file
@@ -24,15 +20,26 @@ and respond to messages from users.
      b. If --private flag, set is_private: true
      c. Use returned channel_id
    - Else if --channel specified:
-     a. Use that channel name/ID
+     a. If it looks like a name (starts with #), call channels_list to resolve the ID
+     b. Otherwise use as channel_id directly
    - Else:
      a. Use "channel" from config file
      b. If not set, error: "No channel specified. Use --channel <name> or create .slack-listener.json"
 
-4. Announce startup:
-   - Post message to channel: "Claude is now listening. Mention me or ask questions!"
+4. Create persistent subscription:
+   - Call `slack_subscribe` with channels: [<channel_id>], include_reactions: false
+   - Store the returned `subscription_id` — reuse it for all watcher launches
 
-5. Record the current timestamp as `last_seen_ts` (use the timestamp of your announcement message)
+5. Resolve bot name:
+   - If `bot_name` is set in config, use it
+   - Otherwise, take the project directory name (basename of the working directory),
+     strip common suffixes (-server, -app, -bot, -service), and convert kebab-case to PascalCase
+   - Use this name when announcing and signing messages
+
+6. Announce startup:
+   - Post message to channel: "[BotName] is listening. Send a message and I'll respond in-thread."
+
+7. Launch the background watcher (see below).
 
 ## Configuration Schema
 
@@ -41,193 +48,128 @@ and respond to messages from users.
   "channel": "#channel-name",
   "project_context": "Description of this project",
   "auto_handle": ["question", "bug", "review"],
-  "require_approval": ["deploy", "merge", "delete"],
-  "include_reactions": false,
-  "mode": "event"
+  "require_approval": ["deploy", "merge", "delete"]
 }
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | channel | string | required | Channel to monitor |
+| bot_name | string | (auto) | Display name for the bot. If omitted, derive from project directory: strip common suffixes (-server, -app, -bot, -service), convert kebab-case to PascalCase. E.g. `slack-mcp-bidir-server` → `SlackMcpBidir` |
 | project_context | string | "" | Project description for context |
 | auto_handle | string[] | ["question"] | Request types to handle automatically |
 | require_approval | string[] | [] | Request types needing confirmation |
-| include_reactions | boolean | false | Also listen for reaction events |
-| mode | string | "subscribe" | Listening mode: "subscribe", "event", or "poll" |
 
-## Main Loop
+## Background Watcher
+
+Launch a background agent using the Task tool with `run_in_background: true`, `subagent_type: "general-purpose"`, and `model: "haiku"` (faster model for simple filtering). Use exactly this prompt template, substituting the channel_id:
 
 ```
-while true:
-    1. Wait for new message (event mode or poll mode)
-    2. Handle timeout/no new messages -> continue
-    3. Skip bot messages -> continue
-    4. Acknowledge message
-    5. Evaluate request type
-    6. Handle or request approval
-    7. Post response
-    8. Mark complete
+You are a Slack watcher. Wait for events and EXIT when a real user message arrives.
+
+Channel ID: "<CHANNEL_ID>"
+
+Loop:
+1. Call mcp__slack-bidir__slack_wait_for_event with channels: ["<CHANNEL_ID>"], timeout_seconds: 300.
+2. If the result contains a message event:
+   - If is_bot_message is true or user_name matches your bot name: discard and continue loop.
+   - If event_type contains "reaction": discard and continue loop.
+   - Otherwise: immediately call mcp__slack-bidir__reactions_add with channel_id, timestamp=message_ts, emoji="eyes". Then return the full event JSON and EXIT.
+3. If timeout: continue loop.
+
+CRITICAL: Do NOT reply to or handle any messages. Your ONLY actions are: detect, react with eyes, return event data, and exit.
 ```
 
-### Step 0 (once, at startup): Create Subscription
+Store the agent/task ID so you can check on it or stop it if needed.
 
-**Subscribe mode only** (default):
-Call `slack_subscribe` with:
-- channels: [<resolved_channel>]
-- include_reactions: <from_config>
+## Handling Events
 
-Store the returned `subscription_id` for use in the main loop.
+When the background watcher exits and returns event data:
 
-### Step 1: Wait for New Message
+### Step 1: Parse Events
 
-**Subscribe mode** (default, persistent):
-Call `slack_get_events` with:
-- subscription_id: <stored subscription_id>
+Extract from the returned event data:
+- `channel_id`
+- `message_ts` (use as thread_ts for replies)
+- `text`
+- `user_name`
+- `files` (if present)
 
-This is non-blocking and returns all buffered events since the last drain.
-If event_count is 0, call `slack_wait_for_event` with timeout_seconds: 30 as a short
-blocking wait to avoid busy-looping, then call `slack_get_events` again.
-Process events one at a time (oldest first). After processing all events, loop back.
+### Step 2: Handle File Attachments (if present)
 
-**Event mode** (ephemeral, foreground):
-Call `slack_wait_for_event` with:
-- channels: [<resolved_channel>]
-- include_reactions: <from_config>
-- timeout_seconds: 300
+Note: The watcher already applied :eyes: on detection, so no need to acknowledge here.
 
-If event_type is "timeout", continue loop.
+If the event includes files:
+1. Call `slack_download_file` for each file_id
+2. Include file contents in your analysis context
 
-**Poll mode** (fallback, no Socket Mode needed):
-Call `conversations_history` with:
-- channel_id: <resolved_channel>
-- limit: "50"
+### Step 4: Evaluate Request Type
 
-Parse the CSV response. Find all messages with a timestamp newer than `last_seen_ts`.
-Filter out bot messages (where UserName matches the bot's name or UserID matches the bot).
-If no new human messages found, sleep 10 seconds (use Bash: `sleep 10`) and continue loop.
-If new messages found, process the OLDEST unprocessed one first.
-Update `last_seen_ts` to the timestamp of the message being processed.
+Classify the message:
+- "question" — asking for information or help
+- "bug" — reporting an issue to investigate
+- "review" — requesting code/design review
+- "deploy" — requesting deployment action
+- "merge" — requesting merge/integration
+- "delete" — requesting deletion of something
+- "other" — unclear, ask for clarification
 
-### Step 2: Handle Timeout / No Messages
+### Step 5: Handle or Request Approval
 
-- Event mode: if event_type is "timeout", continue loop silently
-- Poll mode: if no new messages, continue loop silently (after sleep)
-
-### Step 3: Skip Bot Messages
-
-If the message is from a bot (is_bot_message is true, or username matches your bot name):
-- Continue loop (don't respond to bots, including yourself)
-
-### Step 3b: Handle File Attachments
-
-If event.files is non-empty:
-1. For each file in event.files:
-   - Call slack_download_file with file_id
-   - Store content for analysis
-2. Include file contents in your context when evaluating the request
-
-File type handling:
-| File Type | Action |
-|-----------|--------|
-| .log, .txt | Parse for errors, patterns, key events |
-| .c, .h, .py, .js, .go | Code review, bug search, style check |
-| .json, .yaml, .xml | Parse and validate, check for issues |
-| .pdf | Extract text, summarize content |
-| .png, .jpg, .gif | Describe image (if vision available) |
-| .csv, .xlsx | Parse data, summarize, find anomalies |
-| Binary/unknown | Note file received, ask user what to do |
-
-### Step 4: Acknowledge Receipt
-
-Call reactions_add:
-- channel_id: event.channel_id (or the channel being monitored)
-- timestamp: event.message_ts (or the MsgID from poll results)
-- emoji: "eyes"
-
-This shows the user you've seen their message.
-
-### Step 5: Evaluate Request Type
-
-Analyze the message text to classify:
-- "question" -- asking for information or help
-- "bug" -- reporting an issue to investigate
-- "review" -- requesting code/design review
-- "deploy" -- requesting deployment action
-- "merge" -- requesting merge/integration
-- "delete" -- requesting deletion of something
-- "other" -- unclear, ask for clarification
-
-Consider project_context when classifying.
-
-### Step 6: Handle or Request Approval
-
-**If request type is in auto_handle:**
+**If request type is in auto_handle list:**
 - Proceed to handle it
 
-**If request type is in require_approval:**
-1. Post to thread: "I can help with [describe task]. React with thumbsup to proceed or x to cancel."
-2. Wait for response:
-   - Subscribe mode: Call slack_get_events (subscription already includes reactions if configured); if no approval event, use slack_wait_for_event with include_reactions: true, timeout_seconds: 60, then check slack_get_events again. Repeat until approval or 1 hour elapsed.
-   - Event mode: Call slack_wait_for_event with include_reactions: true, timeout_seconds: 3600
-   - Poll mode: Poll conversations_replies on the thread for new responses, check for reaction text
-3. Check response:
-   - thumbsup or white_check_mark -> proceed
-   - x or no_entry_sign -> post "Understood, cancelled." and continue loop
-   - timeout -> post "Request timed out, let me know if you still need this." and continue
+**If request type is in require_approval list:**
+1. Post to thread: "I can help with [describe task]. React with :thumbsup: to proceed or :x: to cancel."
+2. Wait for a response (launch another background watcher with include_reactions: true on the subscription)
+3. On approval → proceed; on rejection → post "Cancelled." and restart watcher
 
 **If unclear:**
 - Post to thread asking for clarification
-- Continue loop (will pick up their reply)
+- Restart watcher to pick up their reply
 
-### Step 7: Execute and Respond
+### Step 6: Execute and Respond
 
 Based on request type:
+- **question:** Research using available tools, post answer in-thread
+- **bug:** Investigate code, post findings and fix in-thread
+- **review:** Analyze code/design, post review in-thread
+- **deploy/merge/delete:** Execute the approved action, post confirmation
 
-**question:**
-- Research using available tools and project knowledge
-- Post answer to thread
+For artifacts (code, logs, diffs): use `slack_upload_file` to share in-thread.
 
-**bug:**
-- Investigate code, search for related issues
-- Post findings and suggested fix to thread
-- If fix is straightforward and in auto_handle, implement it
+### Step 7: Mark Complete
 
-**review:**
-- Analyze the code/design mentioned
-- Post review comments to thread
+1. Call `reactions_remove`:
+   - channel_id: event.channel_id
+   - timestamp: event.message_ts
+   - emoji: "eyes"
+2. Call `reactions_add`:
+   - channel_id: event.channel_id
+   - timestamp: event.message_ts
+   - emoji: "white_check_mark" (success) or "x" (failure)
 
-**deploy/merge/delete:**
-- Only reach here if approved
-- Execute the action
-- Post confirmation to thread
+### Step 8: Drain Buffer and Restart Watcher
 
-For any task producing artifacts (code, logs, diffs):
-- Use slack_upload_file to share in thread
-
-### Step 8: Mark Complete
-
-Call reactions_add:
-- channel_id: event.channel_id
-- timestamp: event.message_ts
-- emoji: "white_check_mark" (success) or "x" (failure)
-
-### Step 9: Loop
-
-Go back to Step 1.
+Before restarting the watcher, drain any events that arrived during handling:
+1. Call `slack_get_events` with the subscription_id
+2. If there are real user messages (filter out bot/reaction events as usual), handle them immediately (repeat steps 1-7 for each)
+3. Once the buffer is empty, launch a new background watcher agent using the same prompt template
+4. Go back to waiting for the next event.
 
 ## Error Handling
 
-- Slack API error -> log the error, post a brief note to the channel, continue listening
-- Timeout on wait -> silently continue the loop
-- Poll returns no data -> sleep and retry
-- If you encounter an error you cannot recover from, post a message to the channel explaining the issue before stopping
+- Slack API error → log the error, post a brief note to the channel, restart watcher
+- Watcher agent fails → restart it
+- If the user stops the session, call `slack_unsubscribe` with the subscription_id if possible
 
 ## Important Notes
 
-- ALWAYS respond in a thread to the original message, not as a top-level message
+- The listener runs **concurrently** with normal work — when the user returns to the keyboard, keep the watcher running in the background. Only stop listening if the user explicitly asks to end it.
+- ALWAYS respond in a thread to the original message, never as a top-level message
 - Keep responses concise and actionable
-- When sharing code, use slack_upload_file for anything longer than a few lines
+- Use slack_upload_file for code longer than a few lines
 - Never expose secrets, tokens, or credentials in Slack messages
 - If a request is ambiguous, ask for clarification rather than guessing
-- In subscribe mode, call slack_unsubscribe with the subscription_id when stopping (if possible)
+- The subscription persists across watcher restarts — do NOT create a new subscription each time
+- **Platform compatibility:** This skill works best with the Claude Code CLI. The VS Code extension does not reliably propagate background agent return values or detect task completion. If running in VS Code, fall back to a foreground blocking Task (without `run_in_background`) or manual `slack_get_events` polling.

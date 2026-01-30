@@ -1,6 +1,6 @@
 # Slack Listener Skill
 
-Monitors a Slack channel and responds to messages.
+Monitors a Slack channel using a background watcher agent and responds to messages.
 
 ## Usage
 
@@ -16,7 +16,6 @@ Monitors a Slack channel and responds to messages.
 | `--create <n>` | Create channel if doesn't exist, then monitor |
 | `--private` | With --create, makes channel private |
 | `--config <path>` | Use alternate config file |
-| `--mode <subscribe\|event\|poll>` | Listening mode: subscribe (persistent, default), event (ephemeral), or poll (history-based) |
 
 ## Examples
 
@@ -25,8 +24,6 @@ Monitors a Slack channel and responds to messages.
 /slack-listen --channel #cala-v2         # Override to specific channel
 /slack-listen --create #experiment       # Create public channel and monitor
 /slack-listen --create #secret --private # Create private channel
-/slack-listen --channel #dev --mode subscribe  # Persistent subscription (default)
-/slack-listen --channel #dev --mode poll       # History polling fallback
 ```
 
 ## Configuration
@@ -46,9 +43,23 @@ Create `.slack-listener.json` in project root:
 
 1. Resolves target channel (from args or config)
 2. Creates channel if --create specified
-3. Enters listen loop:
-   - Waits for messages in channel
-   - Acknowledges with eyes reaction
-   - Evaluates and handles request
-   - Marks complete with white_check_mark or x
-   - Loops
+3. Creates a persistent subscription via `slack_subscribe`
+4. Launches a background watcher agent that polls for events
+5. When the watcher detects a real user message, it exits and returns the event
+6. Parent agent handles the message:
+   - Acknowledges with :eyes: reaction
+   - Evaluates and responds in-thread
+   - Marks complete with :white_check_mark: or :x:
+7. Restarts the background watcher
+8. Loops
+
+## Platform Notes
+
+This skill relies on background Task agents that exit to return events to the parent.
+**Use the Claude Code CLI** (`claude` command) for best results. The CLI properly
+propagates background agent return values and detects task completion via polling.
+
+The **VS Code extension** has limited background task support — agent return values
+may be empty and task completion is not reliably detected. If using VS Code, consider
+a manual polling workflow: use `slack_get_events` directly instead of the background
+watcher pattern.
