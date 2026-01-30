@@ -385,19 +385,6 @@ func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp
 	return mcp.NewToolResultText(result), nil
 }
 
-func isTextMimetype(mimetype string) bool {
-	if strings.HasPrefix(mimetype, "text/") {
-		return true
-	}
-	textMimetypes := map[string]bool{
-		"application/json":       true,
-		"application/xml":        true,
-		"application/javascript": true,
-		"application/x-yaml":     true,
-		"application/x-sh":       true,
-	}
-	return textMimetypes[mimetype]
-}
 
 func escapeJSON(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
