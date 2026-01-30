@@ -1,0 +1,11 @@
+{
+  "name": "Slack MCP Dev",
+  "image": "golang:1.24",
+  "forwardPorts": [13080],
+  "features": {},
+  "customizations": {
+    "vscode": {
+      "extensions": []
+    }
+  }
+}

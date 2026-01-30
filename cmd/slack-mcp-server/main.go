@@ -5,11 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/events"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider"
 	"github.com/korotovsky/slack-mcp-server/pkg/server"
 	"github.com/mattn/go-isatty"
@@ -41,7 +44,56 @@ func main() {
 	}
 
 	p := provider.New(transport, logger)
-	s := server.NewMCPServer(p, logger)
+
+	// Set up context with cancellation for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		logger.Info("Received signal, shutting down",
+			zap.String("context", "console"),
+			zap.String("signal", sig.String()),
+		)
+		cancel()
+	}()
+
+	// Set up Socket Mode if enabled
+	enableEvents := os.Getenv("SLACK_MCP_ENABLE_EVENTS")
+	eventsEnabled := enableEvents == "true" || enableEvents == "1"
+	appToken := os.Getenv("SLACK_MCP_APP_TOKEN")
+
+	var eventRouter *events.EventRouter
+
+	if eventsEnabled {
+		if appToken == "" {
+			logger.Fatal("SLACK_MCP_APP_TOKEN is required when SLACK_MCP_ENABLE_EVENTS is true",
+				zap.String("context", "console"),
+			)
+		}
+		if !strings.HasPrefix(appToken, "xapp-") {
+			logger.Fatal("SLACK_MCP_APP_TOKEN must be an app-level token starting with xapp-",
+				zap.String("context", "console"),
+			)
+		}
+
+		eventRouter = events.NewEventRouter(logger)
+
+		logger.Info("Socket Mode events enabled",
+			zap.String("context", "console"),
+		)
+	}
+
+	serverOpts := server.MCPServerOptions{
+		EventsEnabled: eventsEnabled,
+	}
+	if eventRouter != nil {
+		serverOpts.EventRouter = eventRouter
+	}
+
+	s := server.NewMCPServer(p, logger, serverOpts)
 
 	go func() {
 		var once sync.Once
@@ -49,6 +101,25 @@ func main() {
 		newUsersWatcher(p, &once, logger)()
 		newChannelsWatcher(p, &once, logger)()
 	}()
+
+	// Start Socket Mode client after caches are warming up
+	if eventsEnabled && eventRouter != nil {
+		botToken := os.Getenv("SLACK_MCP_XOXB_TOKEN")
+		if botToken == "" {
+			logger.Fatal("SLACK_MCP_XOXB_TOKEN is required when SLACK_MCP_ENABLE_EVENTS is true",
+				zap.String("context", "console"),
+			)
+		}
+		smClient := events.NewSocketModeClient(botToken, appToken, p, eventRouter, logger)
+		go func() {
+			if err := smClient.Start(ctx); err != nil {
+				logger.Error("Socket Mode client failed",
+					zap.String("context", "console"),
+					zap.Error(err),
+				)
+			}
+		}()
+	}
 
 	switch transport {
 	case "stdio":

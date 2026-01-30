@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/korotovsky/slack-mcp-server/pkg/events"
 	"github.com/korotovsky/slack-mcp-server/pkg/handler"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider"
 	"github.com/korotovsky/slack-mcp-server/pkg/server/auth"
@@ -21,7 +22,17 @@ type MCPServer struct {
 	logger *zap.Logger
 }
 
-func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer {
+// MCPServerOptions holds optional dependencies for the MCP server.
+type MCPServerOptions struct {
+	EventRouter  interface{} // *events.EventRouter, nil if events disabled
+	EventsEnabled bool
+}
+
+func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, opts ...MCPServerOptions) *MCPServer {
+	var options MCPServerOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
 	s := server.NewMCPServer(
 		"Slack MCP Server",
 		version.Version,
@@ -244,6 +255,105 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger) *MCPServer
 		mcp.WithResourceDescription("This resource provides a directory of Slack users."),
 		mcp.WithMIMEType("text/csv"),
 	), conversationsHandler.UsersResource)
+
+	// Register new bidirectional tools
+
+	// slack_wait_for_event — only when Socket Mode events are enabled
+	if options.EventsEnabled {
+		var router *events.EventRouter
+		if options.EventRouter != nil {
+			router = options.EventRouter.(*events.EventRouter)
+		}
+		eventsHandler := handler.NewEventsHandler(provider, router, logger)
+
+		s.AddTool(mcp.NewTool("slack_wait_for_event",
+			mcp.WithDescription("Block until a message or reaction arrives in the specified Slack channels. Returns the event details or times out."),
+			mcp.WithTitleAnnotation("Wait for Slack Event"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithArray("channels",
+				mcp.Required(),
+				mcp.Description("Channel IDs or names to monitor (e.g., ['#cala-dev', 'C0123456'])"),
+			),
+			mcp.WithBoolean("include_reactions",
+				mcp.Description("Also notify on reaction events. Default is false."),
+				mcp.DefaultBool(false),
+			),
+			mcp.WithNumber("timeout_seconds",
+				mcp.Description("Max time to wait in seconds. 0 = no timeout. Default is 300."),
+				mcp.DefaultNumber(300),
+			),
+		), eventsHandler.WaitForEventHandler)
+
+		logger.Info("Registered slack_wait_for_event tool (Socket Mode enabled)",
+			zap.String("context", "console"),
+		)
+	}
+
+	// slack_create_channel
+	channelsManageHandler := handler.NewChannelsManageHandler(provider, logger)
+	s.AddTool(mcp.NewTool("slack_create_channel",
+		mcp.WithDescription("Create a new Slack channel. If the channel already exists, returns the existing channel (idempotent)."),
+		mcp.WithTitleAnnotation("Create Channel"),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Channel name (without #, lowercase, no spaces, max 80 chars)."),
+		),
+		mcp.WithBoolean("is_private",
+			mcp.Description("Create as a private channel. Default is false."),
+			mcp.DefaultBool(false),
+		),
+		mcp.WithString("description",
+			mcp.Description("Channel purpose/description."),
+		),
+	), channelsManageHandler.CreateChannelHandler)
+
+	// slack_upload_file
+	filesHandler := handler.NewFilesHandler(provider, logger)
+	s.AddTool(mcp.NewTool("slack_upload_file",
+		mcp.WithDescription("Upload a file (code, logs, images) to a Slack channel or thread."),
+		mcp.WithTitleAnnotation("Upload File"),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithString("channel_id",
+			mcp.Required(),
+			mcp.Description("Channel ID or name (e.g., 'C0123456' or '#general') to upload to."),
+		),
+		mcp.WithString("filename",
+			mcp.Required(),
+			mcp.Description("Name for the uploaded file (e.g., 'crash.log', 'fix.diff')."),
+		),
+		mcp.WithString("content",
+			mcp.Required(),
+			mcp.Description("Text content or base64-encoded binary content of the file."),
+		),
+		mcp.WithString("content_type",
+			mcp.Description("MIME type of the content. Default is 'text/plain'."),
+			mcp.DefaultString("text/plain"),
+		),
+		mcp.WithString("title",
+			mcp.Description("Title for the file."),
+		),
+		mcp.WithString("initial_comment",
+			mcp.Description("Message to post alongside the file."),
+		),
+		mcp.WithString("thread_ts",
+			mcp.Description("Thread timestamp to upload the file into a thread."),
+		),
+	), filesHandler.UploadFileHandler)
+
+	// slack_download_file
+	s.AddTool(mcp.NewTool("slack_download_file",
+		mcp.WithDescription("Download a file shared in Slack by its file ID. Returns content inline or saves to disk."),
+		mcp.WithTitleAnnotation("Download File"),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("file_id",
+			mcp.Required(),
+			mcp.Description("Slack file ID (from message event files array, e.g., 'F0123ABCDEF')."),
+		),
+		mcp.WithString("save_path",
+			mcp.Description("Optional local path to save the file. If omitted, returns content directly."),
+		),
+	), filesHandler.DownloadFileHandler)
 
 	return &MCPServer{
 		server: s,
