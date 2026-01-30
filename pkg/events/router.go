@@ -1,12 +1,15 @@
 package events
 
 import (
+	"context"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+const DefaultMaxBufferSize = 100
 
 // SlackEvent represents an incoming Slack event routed to subscribers.
 type SlackEvent struct {
@@ -42,18 +45,68 @@ type Subscriber struct {
 	CreatedAt        time.Time
 }
 
+// PersistentSubscriber represents a long-lived subscription that buffers events.
+type PersistentSubscriber struct {
+	ID               string
+	Channels         map[string]bool
+	IncludeReactions bool
+	buffer           []*SlackEvent
+	mu               sync.Mutex
+	maxBufferSize    int
+	lastAccess       time.Time
+	CreatedAt        time.Time
+}
+
+// AppendEvent adds an event to the buffer, dropping the oldest if full.
+// Returns true if an event was dropped due to buffer overflow.
+func (ps *PersistentSubscriber) AppendEvent(event *SlackEvent) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	dropped := false
+	if len(ps.buffer) >= ps.maxBufferSize {
+		ps.buffer = ps.buffer[1:]
+		dropped = true
+	}
+	ps.buffer = append(ps.buffer, event)
+	return dropped
+}
+
+// DrainEvents returns all buffered events and clears the buffer. Updates lastAccess.
+func (ps *PersistentSubscriber) DrainEvents() []*SlackEvent {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	ps.lastAccess = time.Now()
+	if len(ps.buffer) == 0 {
+		return []*SlackEvent{}
+	}
+	result := ps.buffer
+	ps.buffer = nil
+	return result
+}
+
+// IsStale returns true if lastAccess is older than the given duration.
+func (ps *PersistentSubscriber) IsStale(maxAge time.Duration) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return time.Since(ps.lastAccess) > maxAge
+}
+
 // EventRouter manages subscribers and routes incoming events.
 type EventRouter struct {
-	subscribers []*Subscriber
-	mu          sync.RWMutex
-	logger      *zap.Logger
+	subscribers           []*Subscriber
+	persistentSubscribers []*PersistentSubscriber
+	mu                    sync.RWMutex
+	logger                *zap.Logger
 }
 
 // NewEventRouter creates a new EventRouter.
 func NewEventRouter(logger *zap.Logger) *EventRouter {
 	return &EventRouter{
-		subscribers: make([]*Subscriber, 0),
-		logger:      logger,
+		subscribers:           make([]*Subscriber, 0),
+		persistentSubscribers: make([]*PersistentSubscriber, 0),
+		logger:                logger,
 	}
 }
 
@@ -101,7 +154,7 @@ func (r *EventRouter) Unsubscribe(sub *Subscriber) {
 	}
 }
 
-// RouteEvent delivers an event to all matching subscribers.
+// RouteEvent delivers an event to all matching subscribers (ephemeral and persistent).
 func (r *EventRouter) RouteEvent(event *SlackEvent) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -121,15 +174,30 @@ func (r *EventRouter) RouteEvent(event *SlackEvent) {
 		}
 	}
 
+	// Deliver to persistent subscribers
+	persistentDelivered := 0
+	for _, ps := range r.persistentSubscribers {
+		if r.matchesPersistent(ps, event) {
+			dropped := ps.AppendEvent(event)
+			persistentDelivered++
+			if dropped {
+				r.logger.Debug("Persistent subscriber buffer full, oldest event dropped",
+					zap.String("subscriber_id", ps.ID),
+				)
+			}
+		}
+	}
+
 	r.logger.Debug("Event routed",
 		zap.String("event_type", event.Type),
 		zap.String("channel_id", event.ChannelID),
-		zap.Int("subscribers_matched", delivered),
-		zap.Int("subscribers_total", len(r.subscribers)),
+		zap.Int("ephemeral_matched", delivered),
+		zap.Int("persistent_matched", persistentDelivered),
+		zap.Int("subscribers_total", len(r.subscribers)+len(r.persistentSubscribers)),
 	)
 }
 
-// matches checks whether a subscriber should receive the given event.
+// matches checks whether an ephemeral subscriber should receive the given event.
 func (r *EventRouter) matches(sub *Subscriber, event *SlackEvent) bool {
 	if !sub.Channels[event.ChannelID] {
 		return false
@@ -138,4 +206,119 @@ func (r *EventRouter) matches(sub *Subscriber, event *SlackEvent) bool {
 		return false
 	}
 	return true
+}
+
+// matchesPersistent checks whether a persistent subscriber should receive the given event.
+func (r *EventRouter) matchesPersistent(ps *PersistentSubscriber, event *SlackEvent) bool {
+	if !ps.Channels[event.ChannelID] {
+		return false
+	}
+	if event.Type == "reaction" && !ps.IncludeReactions {
+		return false
+	}
+	return true
+}
+
+// PersistentSubscribe creates a new persistent subscription that buffers events.
+func (r *EventRouter) PersistentSubscribe(channelIDs []string, includeReactions bool) *PersistentSubscriber {
+	channels := make(map[string]bool, len(channelIDs))
+	for _, id := range channelIDs {
+		channels[id] = true
+	}
+
+	ps := &PersistentSubscriber{
+		ID:               uuid.New().String(),
+		Channels:         channels,
+		IncludeReactions: includeReactions,
+		buffer:           make([]*SlackEvent, 0),
+		maxBufferSize:    DefaultMaxBufferSize,
+		lastAccess:       time.Now(),
+		CreatedAt:        time.Now(),
+	}
+
+	r.mu.Lock()
+	r.persistentSubscribers = append(r.persistentSubscribers, ps)
+	r.mu.Unlock()
+
+	r.logger.Debug("New persistent subscriber registered",
+		zap.String("subscriber_id", ps.ID),
+		zap.Int("channel_count", len(channelIDs)),
+		zap.Bool("include_reactions", includeReactions),
+		zap.Int("buffer_size", ps.maxBufferSize),
+	)
+
+	return ps
+}
+
+// PersistentUnsubscribe removes a persistent subscription by ID.
+func (r *EventRouter) PersistentUnsubscribe(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i, ps := range r.persistentSubscribers {
+		if ps.ID == id {
+			r.persistentSubscribers = append(r.persistentSubscribers[:i], r.persistentSubscribers[i+1:]...)
+			r.logger.Debug("Persistent subscriber removed",
+				zap.String("subscriber_id", id),
+			)
+			return true
+		}
+	}
+	return false
+}
+
+// GetPersistentSubscriber looks up a persistent subscriber by ID.
+func (r *EventRouter) GetPersistentSubscriber(id string) *PersistentSubscriber {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, ps := range r.persistentSubscribers {
+		if ps.ID == id {
+			return ps
+		}
+	}
+	return nil
+}
+
+// ReapStaleSubscriptions removes persistent subscriptions not accessed within maxAge.
+func (r *EventRouter) ReapStaleSubscriptions(maxAge time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	reaped := 0
+	remaining := make([]*PersistentSubscriber, 0, len(r.persistentSubscribers))
+	for _, ps := range r.persistentSubscribers {
+		if ps.IsStale(maxAge) {
+			r.logger.Info("Reaping stale persistent subscription",
+				zap.String("subscriber_id", ps.ID),
+				zap.Time("created_at", ps.CreatedAt),
+			)
+			reaped++
+		} else {
+			remaining = append(remaining, ps)
+		}
+	}
+	r.persistentSubscribers = remaining
+	return reaped
+}
+
+// StartReaper launches a background goroutine that periodically reaps stale subscriptions.
+func (r *EventRouter) StartReaper(ctx context.Context, interval time.Duration, maxAge time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if reaped := r.ReapStaleSubscriptions(maxAge); reaped > 0 {
+					r.logger.Info("Reaped stale persistent subscriptions",
+						zap.Int("count", reaped),
+					)
+				}
+			}
+		}
+	}()
 }

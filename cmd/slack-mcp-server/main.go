@@ -80,6 +80,7 @@ func main() {
 		}
 
 		eventRouter = events.NewEventRouter(logger)
+		eventRouter.StartReaper(ctx, 5*time.Minute, 1*time.Hour)
 
 		logger.Info("Socket Mode events enabled",
 			zap.String("context", "console"),

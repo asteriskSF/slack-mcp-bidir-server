@@ -287,6 +287,47 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, opts ...MC
 		logger.Info("Registered slack_wait_for_event tool (Socket Mode enabled)",
 			zap.String("context", "console"),
 		)
+
+		// Persistent subscription tools
+		subscriptionsHandler := handler.NewSubscriptionsHandler(provider, router, logger)
+
+		s.AddTool(mcp.NewTool("slack_subscribe",
+			mcp.WithDescription("Register a persistent subscription to receive events from specified Slack channels. Events are buffered server-side until retrieved with slack_get_events. Returns a subscription_id."),
+			mcp.WithTitleAnnotation("Subscribe to Slack Events"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithArray("channels",
+				mcp.Required(),
+				mcp.Description("Channel IDs or names to monitor (e.g., ['#general', 'C0123456'])"),
+			),
+			mcp.WithBoolean("include_reactions",
+				mcp.Description("Also buffer reaction events. Default is false."),
+				mcp.DefaultBool(false),
+			),
+		), subscriptionsHandler.SubscribeHandler)
+
+		s.AddTool(mcp.NewTool("slack_get_events",
+			mcp.WithDescription("Retrieve all buffered events for a persistent subscription. Non-blocking: returns an empty array if no events are queued. Does NOT destroy the subscription."),
+			mcp.WithTitleAnnotation("Get Buffered Slack Events"),
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithString("subscription_id",
+				mcp.Required(),
+				mcp.Description("The subscription ID returned by slack_subscribe."),
+			),
+		), subscriptionsHandler.GetEventsHandler)
+
+		s.AddTool(mcp.NewTool("slack_unsubscribe",
+			mcp.WithDescription("Destroy a persistent subscription and discard any buffered events."),
+			mcp.WithTitleAnnotation("Unsubscribe from Slack Events"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("subscription_id",
+				mcp.Required(),
+				mcp.Description("The subscription ID returned by slack_subscribe."),
+			),
+		), subscriptionsHandler.UnsubscribeHandler)
+
+		logger.Info("Registered persistent subscription tools (slack_subscribe, slack_get_events, slack_unsubscribe)",
+			zap.String("context", "console"),
+		)
 	}
 
 	// slack_create_channel
