@@ -360,7 +360,6 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, opts ...MC
 	), channelsManageHandler.CreateChannelHandler)
 
 	// slack_upload_file
-	filesHandler := handler.NewFilesHandler(provider, logger)
 	s.AddTool(mcp.NewTool("slack_upload_file",
 		mcp.WithDescription("Upload a file (code, logs, images) to a Slack channel or thread."),
 		mcp.WithTitleAnnotation("Upload File"),
@@ -390,21 +389,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, opts ...MC
 		mcp.WithString("thread_ts",
 			mcp.Description("Thread timestamp to upload the file into a thread."),
 		),
-	), filesHandler.UploadFileHandler)
-
-	// slack_download_file
-	s.AddTool(mcp.NewTool("slack_download_file",
-		mcp.WithDescription("Download a file shared in Slack by its file ID. Returns content inline or saves to disk."),
-		mcp.WithTitleAnnotation("Download File"),
-		mcp.WithReadOnlyHintAnnotation(true),
-		mcp.WithString("file_id",
-			mcp.Required(),
-			mcp.Description("Slack file ID (from message event files array, e.g., 'F0123ABCDEF')."),
-		),
-		mcp.WithString("save_path",
-			mcp.Description("Optional local path to save the file. If omitted, returns content directly."),
-		),
-	), filesHandler.DownloadFileHandler)
+	), conversationsHandler.UploadFileHandler)
 
 	return &MCPServer{
 		server: s,

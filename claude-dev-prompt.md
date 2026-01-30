@@ -61,10 +61,10 @@ We're using VS Code Dev Containers. First priority is setting up the dev environ
    - Accepts: channel_id, filename, content, content_type, title, initial_comment, thread_ts
    - Uses `files.uploadV2` API
 
-9. **`slack_download_file`** - Download files:
-   - Accepts: file_id, save_path (optional)
-   - Returns content directly or saves to disk
-   - Fetches via `url_private` with bot token auth
+9. **`attachment_get_data`** - Download file content:
+   - Accepts: file_id
+   - Returns structured JSON: file_id, filename, mimetype, size, encoding, content
+   - Text files returned as plain text, binary as base64 (5MB limit)
 
 10. **`slack_add_reaction`** - Add emoji reactions:
     - Accepts: channel_id, message_ts, emoji

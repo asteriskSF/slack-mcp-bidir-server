@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -1275,6 +1276,97 @@ func buildQuery(freeText []string, filters map[string][]string) string {
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+// UploadFileHandler uploads a file to a Slack channel.
+func (ch *ConversationsHandler) UploadFileHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("UploadFileHandler called", zap.Any("params", request.Params))
+
+	channelID := request.GetString("channel_id", "")
+	if channelID == "" {
+		return nil, errors.New("channel_id parameter is required")
+	}
+
+	// Resolve channel name to ID if needed
+	channelID, err := ch.resolveUploadChannelID(channelID)
+	if err != nil {
+		return nil, err
+	}
+
+	filename := request.GetString("filename", "")
+	if filename == "" {
+		return nil, errors.New("filename parameter is required")
+	}
+
+	content := request.GetString("content", "")
+	if content == "" {
+		return nil, errors.New("content parameter is required")
+	}
+
+	title := request.GetString("title", "")
+	initialComment := request.GetString("initial_comment", "")
+	threadTS := request.GetString("thread_ts", "")
+
+	ch.logger.Debug("Uploading file",
+		zap.String("channel_id", channelID),
+		zap.String("filename", filename),
+		zap.Int("content_length", len(content)),
+	)
+
+	slackClient := ch.apiProvider.Slack().(*provider.MCPSlackClient).Raw().Slack
+
+	params := slack.UploadFileV2Parameters{
+		Channel:        channelID,
+		Filename:       filename,
+		FileSize:       len(content),
+		Reader:         strings.NewReader(content),
+		Title:          title,
+		InitialComment: initialComment,
+		ThreadTimestamp: threadTS,
+	}
+
+	summary, err := slackClient.UploadFileV2Context(ctx, params)
+	if err != nil {
+		ch.logger.Error("Failed to upload file",
+			zap.String("channel_id", channelID),
+			zap.String("filename", filename),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to upload file: %w", err)
+	}
+
+	result := map[string]interface{}{
+		"ok":       true,
+		"file_id":  summary.ID,
+		"filename": filename,
+		"title":    title,
+	}
+
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal result: %w", err)
+	}
+
+	ch.logger.Info("File uploaded successfully",
+		zap.String("file_id", summary.ID),
+		zap.String("filename", filename),
+	)
+
+	return mcp.NewToolResultText(string(jsonBytes)), nil
+}
+
+// resolveUploadChannelID resolves a channel name to a channel ID for file uploads.
+func (ch *ConversationsHandler) resolveUploadChannelID(channel string) (string, error) {
+	if !strings.HasPrefix(channel, "#") && !strings.HasPrefix(channel, "@") {
+		return channel, nil
+	}
+
+	channelsMaps := ch.apiProvider.ProvideChannelsMaps()
+	id, ok := channelsMaps.ChannelsInv[channel]
+	if !ok {
+		return "", fmt.Errorf("channel %q not found", channel)
+	}
+	return channelsMaps.Channels[id].ID, nil
 }
 
 func hasImageBlocks(blocks slack.Blocks) bool {

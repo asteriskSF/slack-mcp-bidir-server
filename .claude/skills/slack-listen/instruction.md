@@ -100,7 +100,7 @@ Extract from the returned event data:
 Note: The watcher already applied :eyes: on detection, so no need to acknowledge here.
 
 If the event includes files:
-1. Call `slack_download_file` for each file_id
+1. Call `attachment_get_data` for each file_id
 2. Include file contents in your analysis context
 
 ### Step 4: Evaluate Request Type
